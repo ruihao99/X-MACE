@@ -127,12 +127,12 @@ def get_optimizer(
 ) -> torch.optim.Optimizer:
     if name == "adam":
         return torch.optim.Adam(
-            parameters, lr=learning_rate, amsgrad=amsgrad, weight_decay=weight_decay
+            parameters, lr=learning_rate, amsgrad=amsgrad, weight_decay=weight_decay, eps=1e-6
         )
 
     if name == "adamw":
         return torch.optim.AdamW(
-            parameters, lr=learning_rate, amsgrad=amsgrad, weight_decay=weight_decay
+            parameters, lr=learning_rate, amsgrad=amsgrad, weight_decay=weight_decay, eps=1e-6
         )
 
     raise RuntimeError(f"Unknown optimizer '{name}'")
