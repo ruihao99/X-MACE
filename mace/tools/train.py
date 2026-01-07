@@ -3,7 +3,6 @@ import logging
 import time
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
-from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -14,6 +13,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch_ema import ExponentialMovingAverage
 from torchmetrics import Metric
+from tqdm import tqdm
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
@@ -128,6 +128,15 @@ def valid_err_log(valid_loss, eval_metrics, logger, log_errors, epoch=None):
         error_socs = eval_metrics["rmse_socs"] * 1e3
         logging.info(
             f"{inintial_phrase}: loss={valid_loss:8.4f}, RMSE_E_per_atom={error_e:8.1f} meV, RMSE_F={error_f:8.1f} meV / A, RMSE_Mu_per_atom={error_mu:8.2f} mDebye, RMSE_Nacs_per_atom={error_nacs:8.2f} RMSE_SOCs_per_atom={error_socs:8.2f}",
+        )
+    elif log_errors == "EnergyNacsDipoleMAE":
+        error_e = eval_metrics["mae_e"] * 1e3
+        error_f = eval_metrics["mae_f"] * 1e3
+        error_mu = eval_metrics["mae_mu"] * 1e3
+        error_nacs = eval_metrics["mae_nacs"] * 1e3
+        error_socs = eval_metrics["mae_socs"] * 1e3
+        logging.info(
+            f"{inintial_phrase}: loss={valid_loss:8.4f}, MAE_E={error_e:8.1f} meV, MAE_F={error_f:8.1f} meV / A, MAE_Nacs={error_nacs:8.2f} MAE_SOCs={error_socs:8.2f}, MAE_Mu={error_mu:8.2f} mDebye.",
         )
 
 
@@ -326,7 +335,9 @@ def train_one_epoch(
     rank: Optional[int] = 0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
-    for batch in tqdm(data_loader):
+    # for batch in tqdm(data_loader):
+    # RHB: don't use tqdm
+    for batch in data_loader:
         _, opt_metrics = take_step(
             model=model_to_train,
             loss_fn=loss_fn,
@@ -368,9 +379,13 @@ def take_step(
     )
 
     if model_type == "AutoencoderExcitedMACE":
-        centred_energy = (batch["energy"] - output["e0s"] - output["pair_energy"]).unsqueeze(-1)
+        centred_energy = (
+            batch["energy"] - output["e0s"] - output["pair_energy"]
+        ).unsqueeze(-1)
         encoded_energy = model.perm_encoder(centred_energy)
-        decoded_energy = model.perm_decoder(encoded_energy) + output["e0s"] + output["pair_energy"]
+        decoded_energy = (
+            model.perm_decoder(encoded_energy) + output["e0s"] + output["pair_energy"]
+        )
         output["encoded_energy"] = encoded_energy
         output["decoded_energy"] = decoded_energy
 
@@ -469,7 +484,6 @@ class MACELoss(Metric):
         self.add_state("delta_socs", default=[], dist_reduce_fx="cat")
         self.add_state("delta_socs_per_atom", default=[], dist_reduce_fx="cat")
 
-
     def update(self, batch, output):  # pylint: disable=arguments-differ
         loss = self.loss_fn(pred=output, ref=batch)
         self.total_loss += loss
@@ -479,27 +493,29 @@ class MACELoss(Metric):
             self.E_computed += 1.0
             self.delta_es.append(batch.energy - output["energy"])
             self.delta_es_per_atom.append(
-                (batch.energy - output["energy"]) / (batch.ptr[1:] - batch.ptr[:-1]).unsqueeze(-1)
+                (batch.energy - output["energy"])
+                / (batch.ptr[1:] - batch.ptr[:-1]).unsqueeze(-1)
             )
         if output.get("forces") is not None and (batch.forces != 0).any():
-           self.Fs_computed += 1.0
-           self.fs.append(batch.forces)
-           self.delta_fs.append(batch.forces - output["forces"] )
+            self.Fs_computed += 1.0
+            self.fs.append(batch.forces)
+            self.delta_fs.append(batch.forces - output["forces"])
 
-        if output.get("dipoles") is not None and (batch.dipoles != 0).any() :
-           self.Mus_computed += 1.0
-           self.mus.append(batch.dipoles)
-           self.delta_mus.append(batch.dipoles - output["dipoles"])
-           self.delta_mus_per_atom.append(
-               (batch.dipoles - output["dipoles"])
-               / (batch.ptr[1:] - batch.ptr[:-1]).unsqueeze(-1).unsqueeze(-1)
-           )
-        if output.get("nacs").shape == batch.nacs.shape and torch.any(batch.nacs != 0):
+        if output.get("dipoles") is not None and (batch.dipoles != 0).any():
+            self.Mus_computed += 1.0
+            self.mus.append(batch.dipoles)
+            self.delta_mus.append(batch.dipoles - output["dipoles"])
+            self.delta_mus_per_atom.append(
+                (batch.dipoles - output["dipoles"])
+                / (batch.ptr[1:] - batch.ptr[:-1]).unsqueeze(-1).unsqueeze(-1)
+            )
+        # if output.get("nacs").shape == batch.nacs.shape and torch.any(batch.nacs != 0):
+        if output.get("nacs") is not None and torch.any(batch.nacs != 0):
             self.nacs_computed += 1.0
             self.nacs.append(batch.nacs)
             neg = torch.abs(batch.nacs - output["nacs"]).unsqueeze(-1)
             pos = torch.abs(batch.nacs + output["nacs"]).unsqueeze(-1)
-            vec = torch.cat((pos,neg),dim=-1)
+            vec = torch.cat((pos, neg), dim=-1)
             val = torch.min(vec, dim=-1)[0]
             self.delta_nacs.append(val)
         if output.get("socs").shape == batch.socs.shape and torch.any(batch.socs != 0):
@@ -507,7 +523,7 @@ class MACELoss(Metric):
             self.socs.append(batch.socs)
             neg = torch.abs(batch.socs - output["socs"]).unsqueeze(-1)
             pos = torch.abs(batch.socs + output["socs"]).unsqueeze(-1)
-            vec = torch.cat((pos,neg),dim=-1)
+            vec = torch.cat((pos, neg), dim=-1)
             val = torch.min(vec, dim=-1)[0]
             self.delta_socs.append(val)
 
@@ -519,6 +535,42 @@ class MACELoss(Metric):
     def compute(self):
         aux = {}
         aux["loss"] = to_numpy(self.total_loss / self.num_data).item()
+
+        # default values to all keys
+        all_keys = [
+            "mae_e",
+            "mae_s",
+            "rmse_e",
+            "rmse_s",
+            "q95_e",
+            "q95_s",
+            "mae_f",
+            "rel_mae_f",
+            "rmse_f",
+            "rel_rmse_f",
+            "q95_f",
+            "mae_nacs",
+            "rel_mae_nacs",
+            "rmse_nacs",
+            "rel_rmse_nacs",
+            "q95_nacs",
+            "mae_socs",
+            "rel_mae_socs",
+            "rmse_socs",
+            "rel_rmse_socs",
+            "q95_socs",
+            "mae_mu",
+            "mae_mu_per_atom",
+            "rel_mae_mu",
+            "rmse_mu",
+            "rmse_mu_per_atom",
+            "rel_rmse_mu",
+            "q95_mu",
+        ]
+
+        for key in all_keys:
+            aux[key] = np.nan
+
         if self.E_computed:
             delta_es = self.convert(self.delta_es)
             delta_es_per_atom = self.convert(self.delta_es_per_atom)

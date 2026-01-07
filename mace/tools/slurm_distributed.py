@@ -7,7 +7,9 @@
 
 import os
 
-import hostlist
+# RHB: adhoc fix, my cluster doesn't support hostlist
+# as long as I don't use --distributed, this should be fine
+# import hostlist
 
 
 class DistributedEnvironment:
