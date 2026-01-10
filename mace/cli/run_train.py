@@ -13,7 +13,6 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Optional
-import time
 
 import numpy as np
 import torch.distributed
@@ -144,9 +143,9 @@ def run(args: argparse.Namespace) -> None:
     # Data preparation
     if args.train_file.endswith(".xyz"):
         if args.valid_file is not None:
-            assert args.valid_file.endswith(
-                ".xyz"
-            ), "valid_file if given must be same format as train_file"
+            assert args.valid_file.endswith(".xyz"), (
+                "valid_file if given must be same format as train_file"
+            )
         config_type_weights = get_config_type_weights(args.config_type_weights)
         collections, atomic_energies_dict = get_dataset_from_xyz(
             work_dir=args.work_dir,
@@ -259,7 +258,7 @@ def run(args: argparse.Namespace) -> None:
         valid_set = data.dataset_from_sharded_hdf5(
             args.valid_file, r_max=args.r_max, z_table=z_table
         )
-    
+
     train_sampler, valid_sampler = None, None
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -306,18 +305,18 @@ def run(args: argparse.Namespace) -> None:
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
             dipoles_weight=args.dipoles_weight,
-            nacs_weight = args.nacs_weight,
-            socs_weight = args.socs_weight
-    )
+            nacs_weight=args.nacs_weight,
+            socs_weight=args.socs_weight,
+        )
     elif args.model == "AutoencoderExcitedMACE":
         loss_fn = modules.InvariantsWeightedEnergyForcesNacsDipoleLoss(
             energy_weight=args.energy_weight,
             forces_weight=args.forces_weight,
             dipoles_weight=args.dipoles_weight,
-            nacs_weight = args.nacs_weight,
-            socs_weight = args.socs_weight
+            nacs_weight=args.nacs_weight,
+            socs_weight=args.socs_weight,
         )
-    
+
     if args.compute_avg_num_neighbors:
         avg_num_neighbors = modules.compute_avg_num_neighbors(train_loader)
         if args.distributed:
@@ -353,7 +352,7 @@ def run(args: argparse.Namespace) -> None:
         "virials": compute_virials,
         "stress": args.compute_stress,
         "dipoles": compute_dipole,
-        "nacs": compute_nacs
+        "nacs": compute_nacs,
     }
 
     logging.info(
@@ -390,7 +389,7 @@ def run(args: argparse.Namespace) -> None:
             f"Message passing with {args.num_channels} channels and max_L={args.max_L} ({model_config_foundation['hidden_irreps']})"
         )
         logging.info(
-            f"{model_config_foundation['num_interactions']} layers, each with correlation order: {model_config_foundation['correlation']} (body order: {model_config_foundation['correlation']+1}) and spherical harmonics up to: l={model_config_foundation['max_ell']}"
+            f"{model_config_foundation['num_interactions']} layers, each with correlation order: {model_config_foundation['correlation']} (body order: {model_config_foundation['correlation'] + 1}) and spherical harmonics up to: l={model_config_foundation['max_ell']}"
         )
         logging.info(
             f"Radial cutoff: {model_config_foundation['r_max']} Å (total receptive field for each atom: {model_config_foundation['r_max'] * model_config_foundation['num_interactions']} Å)"
@@ -404,7 +403,7 @@ def run(args: argparse.Namespace) -> None:
             f"Message passing with {args.num_channels} channels and max_L={args.max_L} ({args.hidden_irreps})"
         )
         logging.info(
-            f"{args.num_interactions} layers, each with correlation order: {args.correlation} (body order: {args.correlation+1}) and spherical harmonics up to: l={args.max_ell}"
+            f"{args.num_interactions} layers, each with correlation order: {args.correlation} (body order: {args.correlation + 1}) and spherical harmonics up to: l={args.max_ell}"
         )
         logging.info(
             f"{args.num_radial_basis} radial and {args.num_cutoff_basis} basis functions"
@@ -450,7 +449,7 @@ def run(args: argparse.Namespace) -> None:
             soc_num=args.soc_num,
             nac_num=args.nac_num,
         )
-    
+
     elif args.model == "AutoencoderExcitedMACE":
         model = modules.AutoencoderExcitedMACE(
             **model_config,
@@ -473,7 +472,7 @@ def run(args: argparse.Namespace) -> None:
         )
     else:
         raise RuntimeError(f"Unknown model: '{args.model}'")
-    
+
     if args.foundation_model is not None:
         model = load_foundations(
             model,
@@ -482,7 +481,7 @@ def run(args: argparse.Namespace) -> None:
             load_readout=True,
             max_L=args.max_L,
         )
-        
+
     print(model)
     model.to(device)
 
@@ -495,7 +494,7 @@ def run(args: argparse.Namespace) -> None:
     if args.ema:
         logging.info(f"Using Exponential Moving Average with decay: {args.ema_decay}")
     logging.info(
-        f"Number of gradient updates: {int(args.max_num_epochs*len(collections.train)/args.batch_size)}"
+        f"Number of gradient updates: {int(args.max_num_epochs * len(collections.train) / args.batch_size)}"
     )
     logging.info(f"Learning rate: {args.lr}, weight decay: {args.weight_decay}")
     logging.info(loss_fn)
@@ -584,7 +583,7 @@ def run(args: argparse.Namespace) -> None:
             lr=args.lr,
             amsgrad=args.amsgrad,
             betas=(args.beta, 0.999),
-        )    
+        )
 
     optimizer: torch.optim.Optimizer
     if args.optimizer == "adamw":
@@ -601,9 +600,7 @@ def run(args: argparse.Namespace) -> None:
     else:
         optimizer = torch.optim.Adam(**param_options)
 
-    logger = tools.MetricsLogger(
-        directory=args.results_dir, tag=tag + "_train"
-    )  # pylint: disable=E1123
+    logger = tools.MetricsLogger(directory=args.results_dir, tag=tag + "_train")  # pylint: disable=E1123
 
     lr_scheduler = LRScheduler(optimizer, args)
 
@@ -643,7 +640,7 @@ def run(args: argparse.Namespace) -> None:
                 forces_weight=args.forces_weight,
                 dipole_weight=args.dipoles_weight,
                 nacs_weight=args.nacs_weight,
-                socs_weight=args.socs_weight
+                socs_weight=args.socs_weight,
             )
         logging.info(loss_fn_energy)
         swa = tools.SWAContainer(

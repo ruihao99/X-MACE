@@ -2,11 +2,15 @@ import dataclasses
 import logging
 import time
 from contextlib import nullcontext
+from copy import deepcopy
+from itertools import product
+from pprint import pprint
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.distributed
+from numpy._typing import NDArray
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim.swa_utils import SWALR, AveragedModel
 from torch.utils.data import DataLoader
@@ -136,7 +140,7 @@ def valid_err_log(valid_loss, eval_metrics, logger, log_errors, epoch=None):
         error_nacs = eval_metrics["mae_nacs"] * 1e3
         error_socs = eval_metrics["mae_socs"] * 1e3
         logging.info(
-            f"{inintial_phrase}: loss={valid_loss:8.4f}, MAE_E={error_e:8.1f} meV, MAE_F={error_f:8.1f} meV / A, MAE_Nacs={error_nacs:8.2f} MAE_SOCs={error_socs:8.2f}, MAE_Mu={error_mu:8.2f} mDebye.",
+            f"{inintial_phrase}: loss={valid_loss:8.4f}, MAE_E={error_e:8.1f} meV, MAE_F={error_f:8.1f} meV / A, MAE_SmoothNacs={error_nacs:8.2f} meV / A MAE_SOCs={error_socs:8.2f}, MAE_Mu={error_mu:8.2f} mDebye.",
         )
 
 
@@ -195,6 +199,7 @@ def train(
             output_args=output_args,
             device=device,
             model_type=model_type,
+            epoch=epoch,
         )
         valid_err_log(valid_loss, eval_metrics, logger, log_errors, None)
 
@@ -257,6 +262,7 @@ def train(
                     output_args=output_args,
                     device=device,
                     model_type=model_type,
+                    epoch=epoch,
                 )
             if rank == 0:
                 valid_err_log(
@@ -348,6 +354,7 @@ def train_one_epoch(
             max_grad_norm=max_grad_norm,
             device=device,
             model_type=model_type,
+            epoch=epoch,
         )
         opt_metrics["mode"] = "opt"
         opt_metrics["epoch"] = epoch
@@ -365,6 +372,7 @@ def take_step(
     max_grad_norm: Optional[float],
     device: torch.device,
     model_type: str,
+    epoch: int,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -389,7 +397,11 @@ def take_step(
         output["encoded_energy"] = encoded_energy
         output["decoded_energy"] = decoded_energy
 
-    loss = loss_fn(pred=output, ref=batch)
+    if model_type == "AutoencoderExcitedMACE" or model_type == "ExcitedMACE":
+        loss = loss_fn(pred=output, ref=batch, epoch=epoch)
+    else:
+        loss = loss_fn(pred=output, ref=batch)
+
     loss.backward()
     if max_grad_norm is not None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
@@ -413,11 +425,21 @@ def evaluate(
     output_args: Dict[str, bool],
     device: torch.device,
     model_type: str,
+    epoch: int,
 ) -> Tuple[float, Dict[str, Any]]:
     for param in model.parameters():
         param.requires_grad = False
 
-    metrics = MACELoss(loss_fn=loss_fn).to(device)
+    if hasattr(model, "n_energies"):
+        n_states = model.n_energies
+        n_atoms = data_loader.dataset[0]["nacs"].shape[0]
+        metrics = MACELoss(
+            loss_fn=loss_fn, model_type=model_type, n_states=n_states
+        ).to(device)
+    else:
+        n_states = None
+        n_atoms = None
+        metrics = MACELoss(loss_fn=loss_fn, model_type=model_type).to(device)
 
     start_time = time.time()
     for batch in data_loader:
@@ -431,13 +453,26 @@ def evaluate(
             compute_stress=output_args["stress"],
         )
 
+        # if model_type == "AutoencoderExcitedMACE":
+        #     encoded_energy = model.perm_encoder(batch["energy"].unsqueeze(-1))
+        #     decoded_energy = model.perm_decoder(encoded_energy)
+        #     output["encoded_energy"] = encoded_energy
+        #     output["decoded_energy"] = decoded_energy
+
         if model_type == "AutoencoderExcitedMACE":
-            encoded_energy = model.perm_encoder(batch["energy"].unsqueeze(-1))
-            decoded_energy = model.perm_decoder(encoded_energy)
+            centred_energy = (
+                batch["energy"] - output["e0s"] - output["pair_energy"]
+            ).unsqueeze(-1)
+            encoded_energy = model.perm_encoder(centred_energy)
+            decoded_energy = (
+                model.perm_decoder(encoded_energy)
+                + output["e0s"]
+                + output["pair_energy"]
+            )
             output["encoded_energy"] = encoded_energy
             output["decoded_energy"] = decoded_energy
 
-        avg_loss, aux = metrics(batch, output)
+        avg_loss, aux = metrics(batch, output, n_atoms, epoch=epoch)
 
     avg_loss, aux = metrics.compute()
     aux["time"] = time.time() - start_time
@@ -450,7 +485,9 @@ def evaluate(
 
 
 class MACELoss(Metric):
-    def __init__(self, loss_fn: torch.nn.Module):
+    def __init__(
+        self, loss_fn: torch.nn.Module, model_type: str, n_states: Optional[int] = None
+    ):
         super().__init__()
         self.loss_fn = loss_fn
         self.add_state("total_loss", default=torch.tensor(0.0), dist_reduce_fx="sum")
@@ -484,8 +521,28 @@ class MACELoss(Metric):
         self.add_state("delta_socs", default=[], dist_reduce_fx="cat")
         self.add_state("delta_socs_per_atom", default=[], dist_reduce_fx="cat")
 
-    def update(self, batch, output):  # pylint: disable=arguments-differ
-        loss = self.loss_fn(pred=output, ref=batch)
+        # the signs of the nacs
+        # Following J. Phys. Chem. Lett. 2020, 11, 3828−3834
+        if n_states is not None:
+            self.p_configs = MACELoss.generate_rel_sign_configs(n_states)
+            self.pp_configs = [self.states_sign_to_nac_sign(p) for p in self.p_configs]
+            self.n_sign_configs = self.p_configs.shape[0]
+        else:
+            self.p_configs = None
+            self.pp_configs = None
+            self.n_sign_configs = None
+
+        self.model_type = model_type
+
+    def update(self, batch, output, n_atoms, epoch):  # pylint: disable=arguments-differ
+        if (
+            self.model_type == "AutoencoderExcitedMACE"
+            or self.model_type == "ExcitedMACE"
+        ):
+            loss = self.loss_fn(pred=output, ref=batch, epoch=epoch)
+        else:
+            loss = self.loss_fn(pred=output, ref=batch)
+
         self.total_loss += loss
         self.num_data += batch.num_graphs
 
@@ -501,6 +558,20 @@ class MACELoss(Metric):
             self.fs.append(batch.forces)
             self.delta_fs.append(batch.forces - output["forces"])
 
+            def pprint_mat_compare(x, y, fmt):
+                nrows = x.shape[0]
+                ncols = x.shape[1]
+                for i in range(nrows):
+                    msg = ""
+                    for j in range(ncols):
+                        msg += f"{x[i, j]:{fmt}} | {y[i, j]:{fmt}}"
+                    print(msg)
+
+            # pprint_mat_compare(
+            #     batch.forces[:, 0, :], output["forces"][:, 0, :], "12.6f"
+            # )
+            # print()
+
         if output.get("dipoles") is not None and (batch.dipoles != 0).any():
             self.Mus_computed += 1.0
             self.mus.append(batch.dipoles)
@@ -509,15 +580,74 @@ class MACELoss(Metric):
                 (batch.dipoles - output["dipoles"])
                 / (batch.ptr[1:] - batch.ptr[:-1]).unsqueeze(-1).unsqueeze(-1)
             )
-        # if output.get("nacs").shape == batch.nacs.shape and torch.any(batch.nacs != 0):
-        if output.get("nacs") is not None and torch.any(batch.nacs != 0):
+        if output.get("nacs").shape == batch.nacs.shape and torch.any(batch.nacs != 0):
+            if self.p_configs is None:
+                raise ValueError(
+                    "To train with NACS, please provide the number of states when initializing the MACELoss object."
+                )
             self.nacs_computed += 1.0
             self.nacs.append(batch.nacs)
-            neg = torch.abs(batch.nacs - output["nacs"]).unsqueeze(-1)
-            pos = torch.abs(batch.nacs + output["nacs"]).unsqueeze(-1)
-            vec = torch.cat((pos, neg), dim=-1)
-            val = torch.min(vec, dim=-1)[0]
-            self.delta_nacs.append(val)
+
+            # print(f"{output.get('nacs').shape=}")
+            # print(f"{batch.nacs.shape=}")
+            # print(f"{self.p_configs.shape=}")
+            # print(f"{self.n_sign_configs=}")
+
+            # compute all the possible sign configurations
+
+            npairs = batch.nacs.shape[1]
+            nacs_pred = output["nacs"].reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
+            nacs_true = batch.nacs.reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
+            signs = torch.stack(self.pp_configs).to(self.device)  # [n_cfg, n_pairs]
+            tmp = nacs_true - nacs_pred * signs[:, None, None, :, None]
+            mse = torch.mean((tmp) ** 2, dim=(2, 4))
+            min_idx = torch.min(mse, dim=0)[1]
+            best_signs = signs[min_idx, torch.arange(npairs, device=self.device)]
+            best_signs = best_signs.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
+            diff = nacs_true - nacs_pred * best_signs
+
+
+            # diff = nacs_true - nacs_pred_signed
+
+
+            def pprint_mat_compare(x, y, fmt):
+                nrows = x.shape[0]
+                ncols = x.shape[1]
+                for i in range(nrows):
+                    msg = ""
+                    for j in range(ncols):
+                        msg += f"{x[i, j]:{fmt}} | {y[i, j]:{fmt}}"
+                    print(msg)
+
+            # for bb in range(batch_size):
+            #     pprint_mat_compare(
+            #         nacs_true[bb, :, 0, :], nacs_pred[bb, :, 0, :], "12.6f"
+            #     )
+            #     print()
+
+            # for ii in range(batch_size):
+            #     mae_ii = torch.inf
+            #     diff_ii = None
+            #     for p in self.p_configs:
+            #         nac_signs = MACELoss.states_sign_to_nac_sign(p, self.device)
+            #         diff_tmp = torch.abs(
+            #             nacs_true[ii, :, :, :]
+            #             - nacs_pred[ii, :, :, :] * nac_signs[None, :, None]
+            #         )
+
+            #         mae_tmp = torch.mean(diff_tmp)
+            #         # print(f"{mae_tmp = }, {mae_ii = }")
+            #         if mae_tmp < mae_ii:
+            #             mae_ii = mae_tmp
+            #             diff_ii = diff_tmp
+            #     # print()
+
+            #     if diff_ii is None:
+            #         raise ValueError("diff_ii is None")
+
+            #     diff[ii] = diff_ii
+            vals = diff.reshape(-1, npairs, 3)
+            self.delta_nacs.append(vals)
         if output.get("socs").shape == batch.socs.shape and torch.any(batch.socs != 0):
             self.socs_computed += 1.0
             self.socs.append(batch.socs)
@@ -616,3 +746,30 @@ class MACELoss(Metric):
             aux["q95_mu"] = compute_q95(delta_mus)
 
         return aux["loss"], aux
+
+    @staticmethod
+    def generate_rel_sign_configs(n):
+        configs = []
+
+        def generate_configs(n):
+            if n < 1:
+                raise ValueError("n must be >= 1")
+
+            for rest in product([1, -1], repeat=n - 1):
+                yield (1,) + rest
+
+        for cfg in generate_configs(n):
+            configs.append(np.array(cfg))
+
+        res_np = np.array(configs)
+
+        return torch.tensor(res_np)
+
+    @staticmethod
+    def states_sign_to_nac_sign(
+        states_sign: torch.Tensor,
+    ) -> torch.Tensor:
+        nstates = states_sign.shape[0]
+        ii, jj = torch.triu_indices(nstates, nstates, 1)
+        nac_sign = states_sign[ii] * states_sign[jj]
+        return nac_sign

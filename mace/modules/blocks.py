@@ -1,6 +1,7 @@
+import time
 from abc import abstractmethod
 from typing import Callable, List, Optional, Tuple, Union
-import time
+
 import numpy as np
 import torch.nn.functional
 from e3nn import nn, o3
@@ -24,12 +25,13 @@ from .radial import (
 )
 from .symmetric_contraction import SymmetricContraction
 
+
 @compile_mode("script")
 class PermutationInvariantDecoder(torch.nn.Module):
     def __init__(self, latent_dim=16, hidden_dim=128, n_energies=3):
         super().__init__()
 
-        self.matrix_vals = 2*n_energies - 1
+        self.matrix_vals = 2 * n_energies - 1
         self.n_energies = n_energies
         self.latent_dim = latent_dim
 
@@ -43,7 +45,9 @@ class PermutationInvariantDecoder(torch.nn.Module):
             torch.nn.ELU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ELU(),
-            torch.nn.Linear(hidden_dim, self.matrix_vals)  # Output layer without activation
+            torch.nn.Linear(
+                hidden_dim, self.matrix_vals
+            ),  # Output layer without activation
         )
 
     def forward(self, z):
@@ -53,18 +57,26 @@ class PermutationInvariantDecoder(torch.nn.Module):
         # Construct matrices from the decoder's output
         matrices = []
         for i in range(z.size(0)):
-            diag_vals = z[i][:self.n_energies]
-            offdiag_vals = z[i][self.n_energies:]
-            matrix = torch.diag(diag_vals) + torch.diag(offdiag_vals, 1) + torch.diag(offdiag_vals, -1)
+            diag_vals = z[i][: self.n_energies]
+            offdiag_vals = z[i][self.n_energies :]
+            matrix = (
+                torch.diag(diag_vals)
+                + torch.diag(offdiag_vals, 1)
+                + torch.diag(offdiag_vals, -1)
+            )
+            # print(f"{matrix=}")
             matrices.append(matrix)
 
         # Stack matrices and compute eigenvalues
         matrices = torch.stack(matrices, dim=0)
-        roots, _ = torch.linalg.eig(matrices)
-        roots = roots.real
-        roots, _ = torch.sort(roots, dim=-1)
+        roots, _ = torch.linalg.eigh(matrices)
+        # roots, _ = torch.linalg.eig(matrices)
+        # roots = roots.real
+        # roots, _ = torch.sort(roots, dim=-1)
+        # print(f"{roots=}")
 
         return roots
+
 
 @compile_mode("script")
 class PermutationInvariantEncoder(torch.nn.Module):
@@ -89,7 +101,7 @@ class PermutationInvariantEncoder(torch.nn.Module):
             torch.nn.ELU(),
             torch.nn.Linear(hidden_dim, hidden_dim),
             torch.nn.ELU(),
-            torch.nn.Linear(hidden_dim, latent_dim)
+            torch.nn.Linear(hidden_dim, latent_dim),
         )
 
     def forward(self, x):
@@ -114,12 +126,25 @@ class LinearNodeEmbeddingBlock(torch.nn.Module):
 
 @compile_mode("script")
 class LinearReadoutBlock(torch.nn.Module):
-    def __init__(self, irreps_in: o3.Irreps, n_energies: int, compute_nacs: bool, nac_indices: int):
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        n_energies: int,
+        compute_nacs: bool,
+        nac_indices: int,
+    ):
         super().__init__()
         if compute_nacs == True:
-            self.linear = o3.Linear(irreps_in=irreps_in, irreps_out=o3.Irreps(str(int(n_energies))+"x0e + "+ str(int(nac_indices)) + "x1o"))
+            self.linear = o3.Linear(
+                irreps_in=irreps_in,
+                irreps_out=o3.Irreps(
+                    str(int(n_energies)) + "x0e + " + str(int(nac_indices)) + "x1o"
+                ),
+            )
         else:
-            self.linear = o3.Linear(irreps_in=irreps_in, irreps_out=o3.Irreps(str(n_energies)+"x0e"))
+            self.linear = o3.Linear(
+                irreps_in=irreps_in, irreps_out=o3.Irreps(str(n_energies) + "x0e")
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
@@ -128,7 +153,13 @@ class LinearReadoutBlock(torch.nn.Module):
 @compile_mode("script")
 class NonLinearReadoutBlock(torch.nn.Module):
     def __init__(
-        self, irreps_in: o3.Irreps, MLP_irreps: o3.Irreps, gate: Optional[Callable], n_energies: int, compute_nacs: bool, nac_indices: int
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        n_energies: int,
+        compute_nacs: bool,
+        nac_indices: int,
     ):
         super().__init__()
         self.hidden_irreps = MLP_irreps
@@ -137,17 +168,21 @@ class NonLinearReadoutBlock(torch.nn.Module):
         self.irreps_in = irreps_in
         if compute_nacs == True:
             self.linear_2 = o3.Linear(
-                irreps_in=self.hidden_irreps, irreps_out=o3.Irreps(str(int(n_energies))+"x0e + " + str(int(nac_indices)) + "x1o")
+                irreps_in=self.hidden_irreps,
+                irreps_out=o3.Irreps(
+                    str(int(n_energies)) + "x0e + " + str(int(nac_indices)) + "x1o"
+                ),
             )
         else:
             self.linear_2 = o3.Linear(
-                irreps_in=self.hidden_irreps, irreps_out=o3.Irreps(str(n_energies)+"x0e")
+                irreps_in=self.hidden_irreps,
+                irreps_out=o3.Irreps(str(n_energies) + "x0e"),
             )
-
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
         x = self.non_linearity(self.linear_1(x))
         return self.linear_2(x)  # [n_nodes, 1]
+
 
 @compile_mode("script")
 class LinearSocReadoutBlock(torch.nn.Module):
@@ -159,10 +194,15 @@ class LinearSocReadoutBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
         return self.linear(x)  # [n_nodes, 1]
 
+
 @compile_mode("script")
 class NonLinearSocReadoutBlock(torch.nn.Module):
     def __init__(
-        self, irreps_in: o3.Irreps, MLP_irreps: o3.Irreps, gate: Optional[Callable], socs_indices: int
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Optional[Callable],
+        socs_indices: int,
     ):
         super().__init__()
         self.irreps_in = irreps_in
@@ -193,14 +233,23 @@ class NonLinearSocReadoutBlock(torch.nn.Module):
         x = self.equivariant_nonlin(self.linear_1(x))
         return self.linear_2(x)  # [n_nodes, 1]
 
+
 @compile_mode("script")
 class LinearDipoleReadoutBlock(torch.nn.Module):
-    def __init__(self, irreps_in: o3.Irreps, n_energies: int, compute_nacs: bool, nac_indices: int):
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        n_energies: int,
+        compute_nacs: bool,
+        nac_indices: int,
+    ):
         super().__init__()
         if compute_nacs == True:
-            self.irreps_out = o3.Irreps(str(int(n_energies))+"x0e + " + str(int(nac_indices)) + "x1o")
+            self.irreps_out = o3.Irreps(
+                str(int(n_energies)) + "x0e + " + str(int(nac_indices)) + "x1o"
+            )
         else:
-            self.irreps_out = o3.Irreps(str(int(n_energies))+"x0e")
+            self.irreps_out = o3.Irreps(str(int(n_energies)) + "x0e")
         self.linear = o3.Linear(irreps_in=irreps_in, irreps_out=self.irreps_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # [n_nodes, irreps]  # [..., ]
@@ -216,15 +265,17 @@ class NonLinearDipoleReadoutBlock(torch.nn.Module):
         gate: Callable,
         n_energies: int,
         compute_nacs: bool,
-        nac_indices: int
+        nac_indices: int,
     ):
         super().__init__()
         self.irreps_in = irreps_in
         self.hidden_irreps = MLP_irreps
         if compute_nacs == True:
-            self.irreps_out = o3.Irreps(str(int(n_energies))+"x0e + " + str(int(nac_indices)) + "x1o")
+            self.irreps_out = o3.Irreps(
+                str(int(n_energies)) + "x0e + " + str(int(nac_indices)) + "x1o"
+            )
         else:
-            self.irreps_out = o3.Irreps(str(int(n_energies))+"x0e")
+            self.irreps_out = o3.Irreps(str(int(n_energies)) + "x0e")
         irreps_scalars = o3.Irreps(
             [(mul, ir) for mul, ir in MLP_irreps if ir.l == 0 and ir in self.irreps_out]
         )
@@ -264,7 +315,8 @@ class AtomicEnergiesBlock(torch.nn.Module):
         )  # [n_elements, ]
 
     def forward(
-        self, x: torch.Tensor  # one-hot of elements [..., n_elements]
+        self,
+        x: torch.Tensor,  # one-hot of elements [..., n_elements]
     ) -> torch.Tensor:  # [..., ]
         return torch.matmul(x, self.atomic_energies)
 
@@ -421,7 +473,7 @@ class TensorProductWeightsBlock(torch.nn.Module):
 
     def __repr__(self):
         return (
-            f'{self.__class__.__name__}(shape=({", ".join(str(s) for s in self.weights.shape)}), '
+            f"{self.__class__.__name__}(shape=({', '.join(str(s) for s in self.weights.shape)}), "
             f"weights={np.prod(self.weights.shape)})"
         )
 
