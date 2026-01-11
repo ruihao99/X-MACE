@@ -594,21 +594,23 @@ class MACELoss(Metric):
             # print(f"{self.n_sign_configs=}")
 
             # compute all the possible sign configurations
+            neg = torch.abs(batch.nacs - output["nacs"]).unsqueeze(-1)
+            pos = torch.abs(batch.nacs + output["nacs"]).unsqueeze(-1)
+            vec = torch.cat((pos,neg),dim=-1)
+            vals = torch.min(vec, dim=-1)[0]
 
-            npairs = batch.nacs.shape[1]
-            nacs_pred = output["nacs"].reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
-            nacs_true = batch.nacs.reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
-            signs = torch.stack(self.pp_configs).to(self.device)  # [n_cfg, n_pairs]
-            tmp = nacs_true - nacs_pred * signs[:, None, None, :, None]
-            mse = torch.mean((tmp) ** 2, dim=(2, 4))
-            min_idx = torch.min(mse, dim=0)[1]
-            best_signs = signs[min_idx, torch.arange(npairs, device=self.device)]
-            best_signs = best_signs.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-            diff = nacs_true - nacs_pred * best_signs
+            # npairs = batch.nacs.shape[1]
+            # nacs_pred = output["nacs"].reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
+            # nacs_true = batch.nacs.reshape(-1, n_atoms, npairs, 3).unsqueeze(0)
+            # signs = torch.stack(self.pp_configs).to(self.device)  # [n_cfg, n_pairs]
+            # tmp = nacs_true - nacs_pred * signs[:, None, None, :, None]
+            # mse = torch.mean((tmp) ** 2, dim=(2, 3, 4))
+            # min_idx = torch.min(mse, dim=0)[1]
+            # best_signs = signs[min_idx]
 
+            # diff = nacs_true - nacs_pred * best_signs[None, :, None, :, None]
 
             # diff = nacs_true - nacs_pred_signed
-
 
             def pprint_mat_compare(x, y, fmt):
                 nrows = x.shape[0]
@@ -646,7 +648,7 @@ class MACELoss(Metric):
             #         raise ValueError("diff_ii is None")
 
             #     diff[ii] = diff_ii
-            vals = diff.reshape(-1, npairs, 3)
+            # vals = diff.reshape(-1, npairs, 3)
             self.delta_nacs.append(vals)
         if output.get("socs").shape == batch.socs.shape and torch.any(batch.socs != 0):
             self.socs_computed += 1.0

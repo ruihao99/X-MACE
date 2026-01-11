@@ -7,6 +7,7 @@
 from itertools import product
 
 import torch
+import math
 
 from mace.tools import TensorDict
 from mace.tools.torch_geometric import Batch
@@ -120,6 +121,24 @@ def states_sign_to_nac_sign(states_sign: torch.tensor, device):
 def softmin(values, alpha, dim):
     return -torch.logsumexp(-alpha * values, dim=dim) / alpha
 
+def soft_min_normalized(values, beta, dim):
+    """
+    Computes SoftMin but normalizes for the number of inputs (N)
+    so the value doesn't drift to negative infinity as beta -> 0.
+    """
+    # values: (batch_size, N_configurations)
+    N = values.shape[1]
+
+    # 1. Standard LogSumExp
+    # shape: (batch_size,)
+    lse = torch.logsumexp(-beta * values, dim=1)
+
+    # 2. Subtract log(N) to normalize
+    # This cancels out the "summing" effect, effectively using the "mean"
+    lse_normalized = lse - math.log(N)
+
+    return -lse_normalized / beta
+
 
 def plain_rmse_loss_nacs(ref: Batch, pred: TensorDict) -> torch.Tensor:
     # plain rmse for the nacs
@@ -128,59 +147,106 @@ def plain_rmse_loss_nacs(ref: Batch, pred: TensorDict) -> torch.Tensor:
     rmse = torch.sqrt(torch.mean(torch.square(nacs_true - nacs_pred)))  # [1, ]
     return rmse
 
+def phase_mse_loss_jpcl2020(
+    ref: Batch,
+    pred: TensorDict,
+    epoch: int,
+    beta0: float = 0.5,
+    beta_max: float = 5.0,
+    hard_switch_epoch: int = 50,
+) -> torch.Tensor:
 
-def phase_mse_loss_jpcl2020(ref: Batch, pred: TensorDict, epoch: int) -> torch.Tensor:
+    device = pred["nacs"].device
     n_records = ref.__num_graphs__
     n_pairs = ref["nacs"].shape[1]
-    device = pred["nacs"].device
     n_states = n_pairs_to_n_states(n_pairs)
-    nacs_true = torch.reshape(ref["nacs"], (n_records, -1, n_pairs, 3)).to(device)
-    nacs_pred = torch.reshape(pred["nacs"], (n_records, -1, n_pairs, 3)).to(device)
+
+    nacs_true = ref["nacs"].reshape(n_records, -1, n_pairs, 3).to(device)
+    nacs_pred = pred["nacs"].reshape(n_records, -1, n_pairs, 3).to(device)
+
+    # sign configs
     p_configs = generate_rel_sign_configs(n_states, device)
     pp_configs = [
         states_sign_to_nac_sign(states_sign, device) for states_sign in p_configs
     ]
     signs = torch.stack(pp_configs)  # [n_cfg, n_pairs]
+
     pred = nacs_pred.unsqueeze(0)  # [1, B, T, P, 3]
     true = nacs_true.unsqueeze(0)  # [1, B, T, P, 3]
+
     signed_pred = pred * signs[:, None, None, :, None]
-    size = torch.prod(torch.tensor(true.shape[1:], device=device))
 
-    mse = torch.mean((true - signed_pred) ** 2, dim=(2, 4))
-    # mse = torch.sum((true - signed_pred) ** 2, dim=(2, 3, 4))
-    # print(f"{rmse.shape=}")
+    # MSE per configuration
+    mse = torch.mean((true - signed_pred) ** 2, dim=(2, 3, 4))
+    # shape: [n_cfg, B]
 
-    # min_rmse = torch.min(rmse)
-    # alpha = min(1.0 + epoch * 0.5, 50.0)  # anneal
-    # min_rmse = torch.sum(softmin(mse, alpha=alpha, dim=0)) / size
-    min_rmse = torch.mean(torch.min(mse, dim=0)[0])
-    # print(f"{mse.shape=} {n_records=}")
-    # print(f"{min_rmse=}")
+    # annealed beta
+    beta = min(beta0 * (epoch + 1), beta_max)
 
-    # all_rmse = torch.zeros(len(pp_configs), device=device)
-    # for ii, sign in enumerate(pp_configs):
-    #     nacs_pred_sign = nacs_pred * sign[None, None, :, None]
-    #     all_rmse[ii] = torch.sqrt(torch.mean(torch.square(nacs_true - nacs_pred_sign)))
-    # print(f"{all_rmse=}")
-    # min_rmse = torch.min(all_rmse)
-    # print(f"{p_configs=}")
-    # print(f"{pp_configs=}")
+    if epoch < hard_switch_epoch:
+        # ----- soft phase (good gradients) -----
+        weights = torch.softmax(-beta * mse.detach(), dim=0)
+        loss = torch.sum(weights * mse, dim=0).mean()
+    else:
+        # ----- hard phase (correct physics) -----
+        loss = torch.min(mse, dim=0).values.mean()
 
-    # print(
-    #     f"{ref["nacs"].shape=}, {pred["nacs"].shape=}, {nacs_true.shape=}, {nacs_pred.shape=}"
-    # )
-    # print(f"{p_configs=}")
+    return loss 
 
-    # nacs: [n_pairs, 3]
-    # neg = torch.sum(
-    #     torch.square(ref["nacs"] - pred["nacs"]), dim=-1
-    # )  # ||y - ŷ||^2 per pair
-    # pos = torch.sum(
-    #     torch.square(ref["nacs"] + pred["nacs"]), dim=-1
-    # )  # ||y + ŷ||^2 per pair
-    # err2 = torch.minimum(pos, neg)  # phase-invariant per pair
-    # return torch.sqrt(torch.mean(err2))
-    return min_rmse
+
+# def phase_mse_loss_jpcl2020(ref: Batch, pred: TensorDict, epoch: int) -> torch.Tensor:
+#     n_records = ref.__num_graphs__
+#     n_pairs = ref["nacs"].shape[1]
+#     device = pred["nacs"].device
+#     n_states = n_pairs_to_n_states(n_pairs)
+#     nacs_true = torch.reshape(ref["nacs"], (n_records, -1, n_pairs, 3)).to(device)
+#     nacs_pred = torch.reshape(pred["nacs"], (n_records, -1, n_pairs, 3)).to(device)
+#     p_configs = generate_rel_sign_configs(n_states, device)
+#     pp_configs = [
+#         states_sign_to_nac_sign(states_sign, device) for states_sign in p_configs
+#     ]
+#     signs = torch.stack(pp_configs)  # [n_cfg, n_pairs]
+#     pred = nacs_pred.unsqueeze(0)  # [1, B, T, P, 3]
+#     true = nacs_true.unsqueeze(0)  # [1, B, T, P, 3]
+#     signed_pred = pred * signs[:, None, None, :, None]
+# 
+#     mse = torch.mean((true - signed_pred) ** 2, dim=(2, 3, 4))
+#     # mse = torch.sum((true - signed_pred) ** 2, dim=(2, 3, 4))
+#     # print(f"{rmse.shape=}")
+# 
+#     # min_rmse = torch.min(rmse)
+#     # alpha = min(1.0 + epoch * 0.5, 50.0)  # anneal
+#     # min_rmse = torch.sum(softmin(mse, alpha=alpha, dim=0)) / size
+#     # min_rmse = torch.mean(torch.min(mse, dim=0)[0])
+#     min_rmse = torch.mean(softmin(mse, alpha=2.0, dim=0))
+#     # min_rmse = torch.mean(soft_min_normalized(mse, beta=2.0, dim=0))
+#     # print(f"{mse.shape=} {n_records=}")
+#     # print(f"{min_rmse=}")
+# 
+#     # all_rmse = torch.zeros(len(pp_configs), device=device)
+#     # for ii, sign in enumerate(pp_configs):
+#     #     nacs_pred_sign = nacs_pred * sign[None, None, :, None]
+#     #     all_rmse[ii] = torch.sqrt(torch.mean(torch.square(nacs_true - nacs_pred_sign)))
+#     # print(f"{all_rmse=}")
+#     # min_rmse = torch.min(all_rmse)
+#     # print(f"{p_configs=}")
+#     # print(f"{pp_configs=}")
+# 
+#     # print(
+#     #     f"{ref["nacs"].shape=}, {pred["nacs"].shape=}, {nacs_true.shape=}, {nacs_pred.shape=}"
+#     # )
+#     # print(f"{p_configs=}")
+# 
+#     # nacs: [n_pairs, 3]
+#     # neg = torch.sum(
+#     #     torch.square(ref["nacs"] - pred["nacs"]), dim=-1
+#     # )  # ||y - ŷ||^2 per pair
+#     # pos = torch.sum(
+#     #     torch.square(ref["nacs"] + pred["nacs"]), dim=-1
+#     # )  # ||y + ŷ||^2 per pair
+#     # err2 = torch.minimum(pos, neg)  # phase-invariant per pair
+#     # return torch.sqrt(torch.mean(err2))
+#     return min_rmse
 
 
 def phase_mse_loss_schnarc(ref: Batch, pred: TensorDict, epoch: int) -> torch.Tensor:
@@ -573,7 +639,8 @@ class WeightedEnergyForcesNacsDipoleLoss(torch.nn.Module):
 
         if ref["nacs"].shape == pred["nacs"].shape:
             # loss += self.nacs_weight * phase_rmse_loss(ref, pred)
-            loss_nac = self.nacs_weight * phase_mse_loss_jpcl2020(ref, pred, epoch)
+            loss_nacs = self.nacs_weight * phase_rmse_loss(ref, pred)
+            # loss_nac = self.nacs_weight * phase_mse_loss_jpcl2020(ref, pred, epoch)
             # loss_nacs = self.nacs_weight * phase_mse_loss_schnarc(ref, pred, epoch)
             loss += loss_nac
 
@@ -651,8 +718,9 @@ class InvariantsWeightedEnergyForcesNacsDipoleLoss(torch.nn.Module):
             loss += loss_force
 
         if ref["nacs"].shape == pred["nacs"].shape:
+            loss_nacs = self.nacs_weight * phase_rmse_loss(ref, pred)
             # loss += self.nacs_weight * phase_rmse_loss(ref, pred)
-            loss_nacs = self.nacs_weight * phase_mse_loss_jpcl2020(ref, pred, epoch)
+            # loss_nacs = self.nacs_weight * phase_mse_loss_jpcl2020(ref, pred, epoch)
             # loss_nacs = self.nacs_weight * phase_mse_loss_schnarc(ref, pred, epoch)
             loss += loss_nacs
 
@@ -666,7 +734,8 @@ class InvariantsWeightedEnergyForcesNacsDipoleLoss(torch.nn.Module):
         if ref["socs"].shape == pred["socs"].shape:
             loss += self.socs_weight * phase_rmse_socs(ref, pred)
 
-        # print(f"{loss_energy = :10.4f} {loss_force = :10.4f} {loss_nacs = :10.4f}")
+        print(f"{loss_energy = :10.4f} {loss_force = :10.4f} {loss_nacs = :10.4f}")
+
         return loss
 
     def __repr__(self):
